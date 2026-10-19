@@ -1,4 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import gsap from 'gsap';
+import { completeHandover, openHandover, readHandover, watchHandover } from './mobileHandover';
 import { StellarWalletsKit } from '@creit.tech/stellar-wallets-kit/sdk';
 import { FreighterModule, FREIGHTER_ID } from '@creit.tech/stellar-wallets-kit/modules/freighter';
 import { AlbedoModule, ALBEDO_ID } from '@creit.tech/stellar-wallets-kit/modules/albedo';
@@ -8,7 +10,6 @@ import { xBullModule, XBULL_ID } from '@creit.tech/stellar-wallets-kit/modules/x
 import { Networks, rpc } from '@stellar/stellar-sdk';
 import { getNetworkDetails, requestAccess } from '@stellar/freighter-api';
 import { authorizePlan, authorizePlanAtomic, PendingTransactionError, pollTransaction, preflightPlan } from './soroban';
-import { authorizePlan, PendingTransactionError, pollTransaction, preflightPlan } from './soroban';
 import { assetContractId, assetKey, authorizeSwapPlan, fetchPayWithBalances, fetchSwapQuote, fromStroops, horizonUrlFor, payWithAssetsFor } from './swap';
 import { isPasskeySupported, authenticateOrRegisterPasskey, PasskeyWalletAdapter } from './passkey';
 import {
@@ -63,11 +64,31 @@ export default function OrbitCheckout({
   const [showWallets, setShowWallets] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [receipt, setReceipt] = useState(null);
+  const [handoverSession, setHandoverSession] = useState(null);
+  const [handoverBusy, setHandoverBusy] = useState(false);
+  const handoverWatcher = useRef(null);
+  const successElement = useRef(null);
+  const incomingChannelId = useMemo(() => {
+    if (typeof window === 'undefined') return null;
+    return new URLSearchParams(window.location.search).get('orbit_handover');
+  }, []);
   const [isDemo, setIsDemo] = useState(false);
   const [feeEstimate, setFeeEstimate] = useState(null);
   const [pending, setPending] = useState(null);
   const [confirmingSeconds, setConfirmingSeconds] = useState(60);
   const [confirming, setConfirming] = useState(false);
+
+  useEffect(() => () => handoverWatcher.current?.stop(), []);
+
+  useEffect(() => {
+    if (receipt && successElement.current) {
+      const animation = gsap.fromTo(successElement.current,
+        { autoAlpha: 0, scale: 0.94, y: 14 },
+        { autoAlpha: 1, scale: 1, y: 0, duration: 0.55, ease: 'power2.out' });
+      return () => animation.kill();
+    }
+    return undefined;
+  }, [receipt]);
 
   // Multi-asset payment (#191): balances, selected pay-with asset, and live swap quote
   const [payWithBalances, setPayWithBalances] = useState([]);
@@ -236,6 +257,26 @@ export default function OrbitCheckout({
     if (plan) dispatch('orbit:ready', { planId: plan.id || planId });
   }, [plan, planId]);
 
+  // Scanning the QR opens the same merchant checkout page inside the mobile
+  // wallet's DApp browser. The server-resolved plan overrides desktop defaults.
+  useEffect(() => {
+    if (!incomingChannelId) return undefined;
+    let mounted = true;
+    const controller = new AbortController();
+    (async () => {
+      const session = await readHandover({ apiUrl, channelId: incomingChannelId });
+      if (session.status !== 'pending') throw new Error('Mobile approval session is no longer active.');
+      const response = await fetch(`${apiUrl}/plans/${encodeURIComponent(session.planId)}`, { signal: controller.signal });
+      if (!response.ok) throw new Error('Unable to load the mobile approval plan.');
+      const { plan: remotePlan } = await response.json();
+      if (!remotePlan || remotePlan.id !== session.planId) throw new Error('Mobile checkout plan mismatch.');
+      if (mounted) { setPlan(remotePlan); setLoading(false); }
+    })().catch((reason) => {
+      if (mounted && reason.name !== 'AbortError') { setError(reason.message); setLoading(false); }
+    });
+    return () => { mounted = false; controller.abort(); };
+  }, [incomingChannelId, apiUrl]);
+
   useEffect(() => {
     const saved = localStorage.getItem(PENDING_KEY);
     if (!saved) return undefined;
@@ -253,7 +294,11 @@ export default function OrbitCheckout({
       .then(() => {
         localStorage.removeItem(PENDING_KEY);
         setPending(null);
-        setReceipt({ vaultHash: transaction.hash, recovered: true });
+        if (transaction.stage === 'approval') {
+          setError('USDC authorization confirmed. Reconnect your wallet and complete the vault subscription.');
+        } else {
+          setReceipt({ vaultHash: transaction.hash, recovered: true });
+        }
       })
       .catch((reason) => {
         if (!(reason instanceof PendingTransactionError)) {
@@ -410,6 +455,47 @@ export default function OrbitCheckout({
     };
   }, [isSwap, selectedPayWith, slippagePct, plan, planCurrency, horizonUrl]);
 
+  const startHandover = async () => {
+    if (!plan?.id || !apiUrl) { setError('A live plan and payment API are required for mobile handover.'); return; }
+    if (typeof window === 'undefined') return;
+    setError(''); setHandoverBusy(true);
+    handoverWatcher.current?.stop();
+    try {
+      const session = await openHandover({
+        apiUrl, planId: plan.id, pageUrl: window.location.href,
+      });
+      setHandoverSession(session);
+      setShowWallets(false);
+      handoverWatcher.current = watchHandover({
+        apiUrl, session,
+        onConfirmed: (confirmed) => {
+          setHandoverSession(null);
+          setAddress(confirmed.customerWalletAddress || '');
+          setReceipt({ vaultHash: confirmed.txHash, mobile: true });
+          dispatch('orbit:subscribed', {
+            subscriptionId: confirmed.subscriptionId, planId: session.planId, txHash: confirmed.txHash,
+          });
+        },
+        onExpired: () => {
+          setHandoverSession(null);
+          setError('Mobile handover expired after five minutes. Start a new session.');
+        },
+        onError: (error) => {
+          // Brief polling interruptions do not invalidate a valid on-chain payment.
+          console.warn('Handover polling unavailable:', error.message);
+        },
+      });
+    } catch (reason) {
+      setError(reason.message || 'Could not start secure mobile handover.');
+    } finally { setHandoverBusy(false); }
+  };
+
+  const cancelHandover = () => {
+    handoverWatcher.current?.stop();
+    handoverWatcher.current = null;
+    setHandoverSession(null);
+  };
+
   const subscribe = async () => {
     if (!validateForm()) return;
     if (isWrongNetwork) {
@@ -437,43 +523,33 @@ export default function OrbitCheckout({
       setConfirmingSeconds(60);
 
       let hashes;
-
-      // Smart wallet session delegation or passkey: execute single-confirmation atomic handshake with relayer sponsorship (#169)
-      if (isSessionKey || passkeyAdapter) {
+      if (isSwap) {
+        hashes = {
+          approvalHash: null,
+          vaultHash: await authorizeSwapPlan({
+            wallet: activeWallet, address,
+            merchantAddress: plan.merchants.wallet_address,
+            amount: plan.usdc_amount, intervalSeconds: plan.interval_seconds,
+            orbitContractId, settlementTokenContractId: tokenContractId, rpcUrl, networkPassphrase,
+            billingCycles: 12,
+            paymentTokenContractId: assetContractId(selectedPayWith, networkPassphrase),
+            routerAddress: plan.swap_router_address,
+            maxInputStroops: swapQuote.maxInputStroops,
+            onSubmitted: ({ stage, hash }) => {
+              localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId }));
+              setPending({ stage, hash });
+            },
+            onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
+          }),
+        };
+      } else if (isSessionKey || passkeyAdapter) {
+        // Smart wallet sessions use a single atomic, sponsor-eligible handshake.
         hashes = await authorizePlanAtomic({
-      // The USDC preflight only applies to same-asset billing. A swap is checked
-      // by the contract when it runs.
-      const preflight = isSwap ? null : await preflightPlan({
-        address,
-        merchantAddress: plan.merchants.wallet_address,
-        amount: plan.usdc_amount,
-        intervalSeconds: plan.interval_seconds,
-        orbitContractId,
-        tokenContractId,
-        rpcUrl,
-        networkPassphrase,
-      });
-
-      if (preflight) setFeeEstimate(preflight);
-      setConfirming(true);
-      setConfirmingSeconds(60);
-
-      const hashes = isSwap
-        ? { approvalHash: null, vaultHash: await authorizeSwapPlan({
-          wallet: activeWallet,
-          address,
+          wallet: activeWallet, address,
           merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
-          intervalSeconds: plan.interval_seconds,
-          orbitContractId,
-          tokenContractId,
-          rpcUrl,
-          networkPassphrase,
-          billingCycles: 12,
-          apiUrl,
-          sponsorFees: true,
-          includeTrustline: true,
-          assetCode: 'USDC',
+          amount: plan.usdc_amount, intervalSeconds: plan.interval_seconds,
+          orbitContractId, tokenContractId, rpcUrl, networkPassphrase,
+          apiUrl, sponsorFees: true, includeTrustline: true,
           onSubmitted: ({ stage, hash, sponsored }) => {
             localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId, sponsored }));
             setPending({ stage, hash, sponsored });
@@ -482,35 +558,17 @@ export default function OrbitCheckout({
         });
       } else {
         const preflight = await preflightPlan({
-          address,
-          merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
-          intervalSeconds: plan.interval_seconds,
-          orbitContractId,
-          tokenContractId,
-          rpcUrl,
-          networkPassphrase,
+          address, merchantAddress: plan.merchants.wallet_address,
+          amount: plan.usdc_amount, intervalSeconds: plan.interval_seconds,
+          orbitContractId, tokenContractId, rpcUrl, networkPassphrase,
         });
-
         setFeeEstimate(preflight);
-
         hashes = await authorizePlan({
-          wallet: activeWallet,
-          address,
+          wallet: activeWallet, address,
           merchantAddress: plan.merchants.wallet_address,
-          amount: plan.usdc_amount,
-          intervalSeconds: plan.interval_seconds,
-          orbitContractId,
-          tokenContractId,
-          rpcUrl,
-          networkPassphrase,
+          amount: plan.usdc_amount, intervalSeconds: plan.interval_seconds,
+          orbitContractId, tokenContractId, rpcUrl, networkPassphrase,
           preflight,
-          settlementTokenContractId: tokenContractId,
-          paymentTokenContractId: assetContractId(selectedPayWith, networkPassphrase),
-          routerAddress: plan.swap_router_address,
-          maxInputStroops: swapQuote.maxInputStroops,
-          rpcUrl,
-          networkPassphrase,
           onSubmitted: ({ stage, hash }) => {
             localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId }));
             setPending({ stage, hash });
@@ -518,24 +576,6 @@ export default function OrbitCheckout({
           onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
         });
       }
-        }) }
-        : await authorizePlan({
-        wallet: activeWallet,
-        address,
-        merchantAddress: plan.merchants.wallet_address,
-        amount: plan.usdc_amount,
-        intervalSeconds: plan.interval_seconds,
-        orbitContractId,
-        tokenContractId,
-        rpcUrl,
-        networkPassphrase,
-        preflight,
-        onSubmitted: ({ stage, hash }) => {
-          localStorage.setItem(PENDING_KEY, JSON.stringify({ stage, hash, planId: plan.id || planId }));
-          setPending({ stage, hash });
-        },
-        onProgress: ({ remainingMs }) => setConfirmingSeconds(Math.ceil(remainingMs / 1000)),
-      });
 
       const response = await fetch(`${apiUrl}/subscriptions`, {
         method: 'POST',
@@ -548,7 +588,18 @@ export default function OrbitCheckout({
       });
 
       if (!response.ok) throw new Error((await response.json()).error || 'Could not record the subscription.');
-      const subscription = await response.json();
+      const payload = await response.json();
+      const subscription = payload.subscription || payload;
+      if (incomingChannelId && !isDemo) {
+        if (!subscription.id || !hashes.vaultHash) {
+          throw new Error('The subscription was created but its payment proof is incomplete; keep the vault transaction hash.');
+        }
+        await completeHandover({
+          apiUrl, channelId: incomingChannelId,
+          txHash: hashes.vaultHash, subscriptionId: subscription.id,
+          customerWalletAddress: address,
+        });
+      }
       localStorage.removeItem(PENDING_KEY);
       setPending(null);
       setReceipt(hashes);
@@ -583,7 +634,11 @@ export default function OrbitCheckout({
       });
       localStorage.removeItem(PENDING_KEY);
       setPending(null);
-      setReceipt({ vaultHash: pending.hash, recovered: true });
+      if (pending.stage === 'approval') {
+        setError('USDC authorization confirmed. Reconnect your wallet and complete the vault subscription.');
+      } else {
+        setReceipt({ vaultHash: pending.hash, recovered: true });
+      }
     } catch (reason) {
       if (!(reason instanceof PendingTransactionError)) setError(reason.message);
     } finally {
@@ -754,8 +809,10 @@ export default function OrbitCheckout({
       )}
 
       {receipt ? (
-        <div role="status">
-          <h3>{receipt.demo ? 'Demo complete - nothing was signed' : 'Subscription active'}</h3>
+        <div ref={successElement} role="status" aria-live="polite">
+          <h3>{receipt.demo ? 'Demo complete - nothing was signed' : receipt.recovered ? 'Vault transaction confirmed' : 'Subscription active'}</h3>
+          {receipt.recovered && <p>Check with the merchant that your subscription was recorded. A confirmed transaction alone does not prove the subscription record exists.</p>}
+          {receipt.mobile && <p>Mobile wallet approval verified on Stellar.</p>}
           {receipt.vaultHash && (
             <a href={`https://stellar.expert/explorer/testnet/tx/${receipt.vaultHash}`} target="_blank" rel="noreferrer">
               View vault transaction
@@ -766,7 +823,16 @@ export default function OrbitCheckout({
         </div>
       ) : (
         !pending &&
-        (address ? (
+        (handoverSession ? (
+          <div role="status" aria-live="polite" className="orbit-mobile-handover">
+            <h3>Scan with your mobile Stellar wallet</h3>
+            <p>Open this checkout in your wallet's mobile DApp browser (LOBSTR or Albedo), connect your wallet and approve the plan.</p>
+            <img src={handoverSession.qrDataUrl} alt="QR code to open Orbit checkout on a mobile wallet" width="280" height="280" style={{ maxWidth: '100%', background: '#fff', padding: 8, borderRadius: 8 }} />
+            <p style={{ fontSize: 12 }}>This session expires in five minutes. The desktop updates only after the Stellar contract and subscription are verified.</p>
+            <a href={handoverSession.url} target="_blank" rel="noopener noreferrer">Open mobile checkout link</a>
+            <button style={styles.cancel} onClick={cancelHandover}>Cancel mobile handover</button>
+          </div>
+        ) : address ? (
           <>
             <p>
               <strong>{isDemo ? 'Demo address' : isSessionKey ? '⚡ Smart Wallet Session' : passkeyAdapter ? 'Passkey account' : 'Wallet'}:</strong> {address.slice(0, 8)}...{address.slice(-5)}
@@ -798,9 +864,16 @@ export default function OrbitCheckout({
             <button style={styles.cancel} onClick={disconnect}>Disconnect</button>
           </>
         ) : (
-          <button className={customClasses.button} style={styles.button} onClick={handleOpenWallets}>
-            Connect wallet
-          </button>
+          <div>
+            <button className={customClasses.button} style={styles.button} onClick={handleOpenWallets}>
+              Connect wallet
+            </button>
+            {!incomingChannelId && (
+              <button style={{ ...styles.wallet, marginTop: 12 }} disabled={handoverBusy} onClick={startHandover}>
+                {handoverBusy ? 'Creating secure QR session…' : 'Scan with Mobile Wallet'}
+              </button>
+            )}
+          </div>
         ))
       )}
 
@@ -810,6 +883,12 @@ export default function OrbitCheckout({
       {showWallets && (
         <div role="dialog" aria-modal="true" aria-labelledby="wallet-title" style={styles.dialog}>
           <h3 id="wallet-title">Choose Payment Method</h3>
+          {!incomingChannelId && (
+            <button style={{ ...styles.wallet, borderColor: 'var(--orbit-accent)' }} disabled={handoverBusy} onClick={startHandover}>
+              {handoverBusy ? 'Creating secure QR session…' : '📱 Scan with Mobile Wallet'}
+              <small style={{ display: 'block', color: 'var(--orbit-muted)' }}>Continue in LOBSTR or Albedo on your phone</small>
+            </button>
+          )}
 
           {/* Smart Wallet Session Key Option (#169) */}
           {hasSessionKey && (

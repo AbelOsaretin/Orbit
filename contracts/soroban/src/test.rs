@@ -3269,6 +3269,9 @@ fn test_revenue_pool_multiple_deposits_claims_and_rounding_carry() {
     assert_eq!(state.pool.undistributed_balance, 0);
     assert_eq!(token_client.balance(&shareholder_a), 5);
     assert_eq!(token_client.balance(&shareholder_b), 10);
+}
+
+// ----------------------------------------------------------------------------
 // MERKLE PAYROLL DISTRIBUTION (#156)
 // ----------------------------------------------------------------------------
 
@@ -3686,6 +3689,9 @@ fn test_gas_subsidy_caps_and_nonce_prevent_reserve_drain() {
     assert_eq!(pool.balance, 90);
     assert_eq!(pool.next_nonce, 1);
     assert_eq!(native_client.balance(&sponsor), 10);
+}
+
+#[test]
 fn test_merkle_payroll_emits_created_and_claimed_events() {
     let env = Env::default();
     let (sender, _, token, contract_id) = payroll_setup(&env);
@@ -4021,4 +4027,228 @@ fn test_deploy_fails_when_no_excess() {
     token_admin_client.mint(&contract_id, &50_0000000);
 
     orbit_client.deploy_idle_capital(&token_address);
+}
+
+
+// ----------------------------------------------------------------------------
+// ISSUE #212: COMPETITIVE BOUNTY COMMIT-REVEAL
+// ----------------------------------------------------------------------------
+
+struct BountyCase {
+    env: Env,
+    contract: Address,
+    token: Address,
+    creator: Address,
+    claimant: Address,
+    proof: Bytes,
+    salt: BytesN<32>,
+    bounty_id: u64,
+}
+
+impl BountyCase {
+    fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_sequence_number(100);
+        let creator = Address::generate(&env);
+        let claimant = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        StellarAssetClient::new(&env, &token).mint(&creator, &1_000_000_000);
+        let contract = env.register(OrbitContract, ());
+        let client = OrbitContractClient::new(&env, &contract);
+        let proof = Bytes::from_slice(&env, b"reviewed-deliverable-49");
+        let salt = BytesN::from_array(&env, &[7u8; 32]);
+        let proof_hash = env.crypto().sha256(&proof).to_bytes();
+        let bounty_id = client.create_bounty(&creator, &token, &500_000_000, &proof_hash, &120);
+        Self { env, contract, token, creator, claimant, proof, salt, bounty_id }
+    }
+
+    fn commit(&self) {
+        let digest = bounty_claim_digest(&self.env, &self.claimant, self.bounty_id, &self.proof, &self.salt);
+        OrbitContractClient::new(&self.env, &self.contract)
+            .commit_bounty_claim(&self.claimant, &self.bounty_id, &digest);
+    }
+
+    fn reveal(&self) {
+        OrbitContractClient::new(&self.env, &self.contract)
+            .reveal_bounty_claim(&self.claimant, &self.bounty_id, &self.proof, &self.salt);
+    }
+}
+
+#[test]
+fn test_bounty_commit_reveal_disburses_once() {
+    let c = BountyCase::new();
+    let token = TokenClient::new(&c.env, &c.token);
+    assert_eq!(token.balance(&c.creator), 500_000_000);
+    assert_eq!(token.balance(&c.contract), 500_000_000);
+    c.commit();
+    c.env.ledger().set_sequence_number(105);
+    c.reveal();
+    assert_eq!(token.balance(&c.claimant), 500_000_000);
+    assert_eq!(token.balance(&c.contract), 0);
+    let bounty = OrbitContractClient::new(&c.env, &c.contract).get_bounty(&c.bounty_id).unwrap();
+    assert_eq!(bounty.claimed_by, Some(c.claimant.clone()));
+    assert!(OrbitContractClient::new(&c.env, &c.contract)
+        .try_reveal_bounty_claim(&c.claimant, &c.bounty_id, &c.proof, &c.salt).is_err());
+}
+
+#[test]
+fn test_bounty_early_reveal_rejected() {
+    let c = BountyCase::new();
+    c.commit();
+    c.env.ledger().set_sequence_number(104);
+    assert!(OrbitContractClient::new(&c.env, &c.contract)
+        .try_reveal_bounty_claim(&c.claimant, &c.bounty_id, &c.proof, &c.salt).is_err());
+    c.env.ledger().set_sequence_number(105);
+    c.reveal();
+}
+
+#[test]
+fn test_bounty_tampered_salt_and_proof_rejected() {
+    let c = BountyCase::new();
+    c.commit();
+    c.env.ledger().set_sequence_number(105);
+    let wrong_salt = BytesN::from_array(&c.env, &[8u8; 32]);
+    let wrong_proof = Bytes::from_slice(&c.env, b"stolen-deliverable");
+    let client = OrbitContractClient::new(&c.env, &c.contract);
+    assert!(client.try_reveal_bounty_claim(&c.claimant, &c.bounty_id, &c.proof, &wrong_salt).is_err());
+    assert!(client.try_reveal_bounty_claim(&c.claimant, &c.bounty_id, &wrong_proof, &c.salt).is_err());
+    assert_eq!(TokenClient::new(&c.env, &c.token).balance(&c.contract), 500_000_000);
+    c.reveal();
+}
+
+#[test]
+fn test_bounty_mismatched_claimant_cannot_steal_commitment() {
+    let c = BountyCase::new();
+    c.commit();
+    c.env.ledger().set_sequence_number(105);
+    let thief = Address::generate(&c.env);
+    let client = OrbitContractClient::new(&c.env, &c.contract);
+    assert!(client.try_reveal_bounty_claim(&thief, &c.bounty_id, &c.proof, &c.salt).is_err());
+    // A different claimant cannot reuse the digest even after committing it.
+    let digest = bounty_claim_digest(&c.env, &c.claimant, c.bounty_id, &c.proof, &c.salt);
+    client.commit_bounty_claim(&thief, &c.bounty_id, &digest);
+    c.env.ledger().set_sequence_number(110);
+    assert!(client.try_reveal_bounty_claim(&thief, &c.bounty_id, &c.proof, &c.salt).is_err());
+    c.reveal();
+}
+
+#[test]
+fn test_bounty_expiry_refund_cannot_be_double_spent() {
+    let c = BountyCase::new();
+    c.env.ledger().set_sequence_number(121);
+    let client = OrbitContractClient::new(&c.env, &c.contract);
+    client.reclaim_expired_bounty(&c.bounty_id);
+    assert_eq!(TokenClient::new(&c.env, &c.token).balance(&c.creator), 1_000_000_000);
+    assert!(client.try_reclaim_expired_bounty(&c.bounty_id).is_err());
+    assert!(client.try_commit_bounty_claim(&c.claimant, &c.bounty_id, &BytesN::from_array(&c.env, &[0u8; 32])).is_err());
+}
+
+
+// ----------------------------------------------------------------------------
+// ISSUE #209: FUNDED MILESTONE ESCROW AND MERCHANT SIGN-OFF
+// ----------------------------------------------------------------------------
+
+struct MilestoneCase {
+    env: Env,
+    client_address: Address,
+    creator: Address,
+    contractor: Address,
+    token: Address,
+    id: u64,
+}
+
+impl MilestoneCase {
+    fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(100);
+        let creator = Address::generate(&env);
+        let contractor = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        StellarAssetClient::new(&env, &token).mint(&creator, &100_0000000);
+        let client_address = env.register(OrbitContract, ());
+        let client = OrbitContractClient::new(&env, &client_address);
+        let first = MilestoneInput {
+            title: String::from_str(&env, "Design"),
+            deliverable_url: String::from_str(&env, "https://example.com/spec"),
+            amount: 10_0000000,
+            due_timestamp: 500,
+        };
+        let second = MilestoneInput {
+            title: String::from_str(&env, "Implementation"),
+            deliverable_url: String::from_str(&env, "https://example.com/code"),
+            amount: 20_0000000,
+            due_timestamp: 600,
+        };
+        let stages = soroban_sdk::vec![&env, first, second];
+        let id = client.create_milestone_project(&creator, &contractor, &token, &stages);
+        Self { env, client_address, creator, contractor, token, id }
+    }
+    fn submit(&self, stage: u32) {
+        OrbitContractClient::new(&self.env, &self.client_address)
+            .submit_milestone_deliverable(
+                &self.contractor, &self.id, &stage,
+                &String::from_str(&self.env, "https://example.com/proof")
+            );
+    }
+}
+
+#[test]
+fn test_milestone_escrow_requires_merchant_signoff() {
+    let c = MilestoneCase::new();
+    let client = OrbitContractClient::new(&c.env, &c.client_address);
+    let token = TokenClient::new(&c.env, &c.token);
+    assert_eq!(token.balance(&c.creator), 70_0000000);
+    assert_eq!(token.balance(&c.client_address), 30_0000000);
+    assert!(client.try_approve_and_release_milestone(&c.creator, &c.id, &0).is_err());
+    c.submit(0);
+    let stage = client.get_milestone_project(&c.id).unwrap().stages.get(0).unwrap();
+    assert!(stage.submitted);
+    assert!(!stage.released);
+    client.approve_and_release_milestone(&c.creator, &c.id, &0);
+    assert_eq!(token.balance(&c.contractor), 10_0000000);
+    assert_eq!(token.balance(&c.client_address), 20_0000000);
+    assert!(client.try_approve_and_release_milestone(&c.creator, &c.id, &0).is_err());
+}
+
+#[test]
+fn test_milestone_changes_force_new_submission_before_release() {
+    let c = MilestoneCase::new();
+    let client = OrbitContractClient::new(&c.env, &c.client_address);
+    c.submit(0);
+    client.request_milestone_changes(&c.creator, &c.id, &0,
+        &String::from_str(&c.env, "Please include unit tests"));
+    assert!(client.try_approve_and_release_milestone(&c.creator, &c.id, &0).is_err());
+    assert!(!client.get_milestone_project(&c.id).unwrap().stages.get(0).unwrap().submitted);
+    c.submit(0);
+    client.approve_and_release_milestone(&c.creator, &c.id, &0);
+}
+
+#[test]
+fn test_milestone_cannot_skip_earlier_approval() {
+    let c = MilestoneCase::new();
+    let client = OrbitContractClient::new(&c.env, &c.client_address);
+    c.submit(1);
+    assert!(client.try_approve_and_release_milestone(&c.creator, &c.id, &1).is_err());
+    c.submit(0);
+    client.approve_and_release_milestone(&c.creator, &c.id, &0);
+    client.approve_and_release_milestone(&c.creator, &c.id, &1);
+    assert_eq!(client.get_milestone_project(&c.id).unwrap().released_amount, 30_0000000);
+}
+
+#[test]
+fn test_milestone_wrong_roles_cannot_approve_or_submit() {
+    let c = MilestoneCase::new();
+    let client = OrbitContractClient::new(&c.env, &c.client_address);
+    let outsider = Address::generate(&c.env);
+    assert!(client.try_submit_milestone_deliverable(
+        &outsider, &c.id, &0, &String::from_str(&c.env, "https://example.com/false")).is_err());
+    c.submit(0);
+    assert!(client.try_request_milestone_changes(
+        &outsider, &c.id, &0, &String::from_str(&c.env, "bad")).is_err());
+    assert!(client.try_approve_and_release_milestone(&outsider, &c.id, &0).is_err());
+    client.approve_and_release_milestone(&c.creator, &c.id, &0);
 }

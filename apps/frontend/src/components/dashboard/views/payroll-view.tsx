@@ -29,6 +29,7 @@ import { useAuth } from "@/lib/auth-context";
 import { Contractor, duplicateWallets, mergeDuplicateRecipients, filterAndSortRecipients, parsePayrollAmount } from "@/lib/payroll";
 import { simulatePayrollRun } from "@/lib/payroll-simulation";
 import { PayrollSimulationModal } from "../modals/payroll-simulation-modal";
+import { MilestonePayrollPanel } from "./milestone-payroll-panel";
 
 const SAMPLE_RECIPIENTS: PayrollRecipient[] = [
   {
@@ -364,6 +365,7 @@ export function PayrollView() {
 
   return (
     <div className="space-y-6">
+      <MilestonePayrollPanel canRunPayroll={canRunPayroll} />
       {/* 1. Header with Actions */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-2">
         <div>

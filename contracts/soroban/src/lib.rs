@@ -204,6 +204,88 @@ pub enum DataKey {
     MerkleClaimed(u64, BytesN<32>),
     /// Router a merchant has pre-approved for cross-asset subscriptions (#191)
     TrustedSwapRouter(Address, Address),
+    NextBountyId,
+    Bounty(u64),
+    BountyCommit(u64, Address),
+    NextMilestoneProjectId,
+    MilestoneProject(u64),
+}
+
+/// Escrowed competitive bounty; creator cannot withdraw while it is claimable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompetitiveBounty {
+    pub creator: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub proof_hash: BytesN<32>,
+    pub expires_at_ledger: u32,
+    pub claimed_by: Option<Address>,
+    pub cancelled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BountyCommitment {
+    pub digest: BytesN<32>,
+    pub ledger: u32,
+}
+
+/// The commitment binds claimant and bounty ID, so copied reveals cannot steal rewards.
+/// Preimage = domain || claimant ScVal XDR || bounty ID BE || proof length BE || proof || salt.
+pub fn bounty_claim_digest(
+    env: &Env,
+    claimant: &Address,
+    bounty_id: u64,
+    proof: &Bytes,
+    salt: &BytesN<32>,
+) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    assert!(proof.len() > 0 && proof.len() <= 4096, "invalid proof length");
+    let mut data = Bytes::from_slice(env, b"orbit:bounty:claim:v1");
+    data.append(&claimant.clone().to_xdr(env));
+    data.extend_from_array(&bounty_id.to_be_bytes());
+    data.extend_from_array(&proof.len().to_be_bytes());
+    data.append(proof);
+    data.extend_from_array(&salt.to_array());
+    env.crypto().sha256(&data).to_bytes()
+}
+
+const BOUNTY_REVEAL_DELAY: u32 = 5;
+
+/// One stage of a fully funded, merchant-gated contractor escrow (#209).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneInput {
+    pub title: String,
+    pub deliverable_url: String,
+    pub amount: i128,
+    pub due_timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneStage {
+    pub title: String,
+    pub deliverable_url: String,
+    pub amount: i128,
+    pub due_timestamp: u64,
+    pub proof_url: String,
+    pub review_feedback: String,
+    pub submitted: bool,
+    pub released: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneProject {
+    pub id: u64,
+    pub merchant: Address,
+    pub contractor: Address,
+    pub token: Address,
+    pub escrowed: i128,
+    pub released_amount: i128,
+    pub stages: Vec<MilestoneStage>,
 }
 
 /// Storage key for a metered (usage-based) vault (#46). An enum on purpose:
@@ -2689,6 +2771,267 @@ impl OrbitContract {
         env.storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
+    }
+
+    // --------------------------------------------------------------------
+    // COMPETITIVE PAYROLL BOUNTIES: COMMIT-REVEAL (#212)
+    // --------------------------------------------------------------------
+
+    /// Fund a single-winner bounty with tokens locked in this contract.
+    /// `proof_hash` is SHA256 of the winning raw proof bytes.
+    /// The deadline is a ledger sequence, not a wall-clock timestamp.
+    pub fn create_bounty(
+        env: Env,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        proof_hash: BytesN<32>,
+        expires_at_ledger: u32,
+    ) -> u64 {
+        creator.require_auth();
+        assert!(amount > 0, "amount must be positive");
+        let now = env.ledger().sequence();
+        assert!(
+            expires_at_ledger > now.saturating_add(BOUNTY_REVEAL_DELAY),
+            "bounty must outlive the challenge period"
+        );
+        // Keep the deadline within a bounded storage lifetime, so expired
+        // escrows can still be reclaimed without depending on archival restore.
+        assert!(
+            expires_at_ledger - now <= MIN_TTL_LEDGERS,
+            "bounty deadline exceeds storage lifetime"
+        );
+        let id: u64 = env.storage().instance().get(&DataKey::NextBountyId).unwrap_or(0);
+        env.storage().instance().set(&DataKey::NextBountyId, &(id.checked_add(1).expect("bounty id overflow")));
+        token::Client::new(&env, &token).transfer(&creator, &env.current_contract_address(), &amount);
+        let bounty = CompetitiveBounty {
+            creator: creator.clone(),
+            token,
+            amount,
+            proof_hash,
+            expires_at_ledger,
+            claimed_by: None,
+            cancelled: false,
+        };
+        let key = DataKey::Bounty(id);
+        env.storage().persistent().set(&key, &bounty);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.events().publish((Symbol::new(&env, "bounty_created"), id), (creator, amount));
+        id
+    }
+
+    /// Store an authenticated commitment. Only one outstanding commitment is
+    /// permitted per claimant and bounty; this makes replay attempts explicit.
+    pub fn commit_bounty_claim(
+        env: Env,
+        claimant: Address,
+        bounty_id: u64,
+        commitment_hash: BytesN<32>,
+    ) {
+        claimant.require_auth();
+        let bounty: CompetitiveBounty = env.storage().persistent()
+            .get(&DataKey::Bounty(bounty_id)).expect("unknown bounty");
+        let now = env.ledger().sequence();
+        assert!(!bounty.cancelled && bounty.claimed_by.is_none(), "bounty unavailable");
+        assert!(now.saturating_add(BOUNTY_REVEAL_DELAY) <= bounty.expires_at_ledger, "too late to commit");
+        let key = DataKey::BountyCommit(bounty_id, claimant.clone());
+        assert!(!env.storage().persistent().has(&key), "commitment already exists");
+        env.storage().persistent().set(&key, &BountyCommitment {
+            digest: commitment_hash,
+            ledger: now,
+        });
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.events().publish((Symbol::new(&env, "bounty_committed"), bounty_id), claimant);
+    }
+
+    /// A reveal cannot execute until five *later* ledgers have closed.
+    /// Both the claimant and the secret salt are part of the preimage.
+    pub fn reveal_bounty_claim(
+        env: Env,
+        claimant: Address,
+        bounty_id: u64,
+        proof: Bytes,
+        secret_salt: BytesN<32>,
+    ) {
+        claimant.require_auth();
+        let key = DataKey::Bounty(bounty_id);
+        let mut bounty: CompetitiveBounty =
+            env.storage().persistent().get(&key).expect("unknown bounty");
+        assert!(!bounty.cancelled && bounty.claimed_by.is_none(), "bounty unavailable");
+        let now = env.ledger().sequence();
+        assert!(now <= bounty.expires_at_ledger, "bounty expired");
+        let claim_key = DataKey::BountyCommit(bounty_id, claimant.clone());
+        let commitment: BountyCommitment =
+            env.storage().persistent().get(&claim_key).expect("claimant did not commit");
+        assert!(
+            now >= commitment.ledger.saturating_add(BOUNTY_REVEAL_DELAY),
+            "reveal is too early"
+        );
+        assert_eq!(
+            bounty_claim_digest(&env, &claimant, bounty_id, &proof, &secret_salt),
+            commitment.digest,
+            "invalid commitment preimage"
+        );
+        assert_eq!(
+            env.crypto().sha256(&proof).to_bytes(),
+            bounty.proof_hash,
+            "invalid bounty solution"
+        );
+        // Update before calling token; failed transfers roll back storage.
+        bounty.claimed_by = Some(claimant.clone());
+        env.storage().persistent().set(&key, &bounty);
+        env.storage().persistent().remove(&claim_key);
+        token::Client::new(&env, &bounty.token).transfer(
+            &env.current_contract_address(), &claimant, &bounty.amount
+        );
+        env.events().publish((Symbol::new(&env, "bounty_claimed"), bounty_id),
+            (claimant, bounty.amount));
+    }
+
+    /// Reclaim only when a bounty expires without a winner.
+    pub fn reclaim_expired_bounty(env: Env, bounty_id: u64) {
+        let key = DataKey::Bounty(bounty_id);
+        let mut bounty: CompetitiveBounty =
+            env.storage().persistent().get(&key).expect("unknown bounty");
+        bounty.creator.require_auth();
+        assert!(env.ledger().sequence() > bounty.expires_at_ledger, "bounty not expired");
+        assert!(!bounty.cancelled && bounty.claimed_by.is_none(), "bounty unavailable");
+        bounty.cancelled = true;
+        env.storage().persistent().set(&key, &bounty);
+        token::Client::new(&env, &bounty.token).transfer(
+            &env.current_contract_address(), &bounty.creator, &bounty.amount
+        );
+    }
+
+    pub fn get_bounty(env: Env, bounty_id: u64) -> Option<CompetitiveBounty> {
+        env.storage().persistent().get(&DataKey::Bounty(bounty_id))
+    }
+
+    // --------------------------------------------------------------------
+    // FUNDED MILESTONE PAYROLL AND SIGN-OFF GATES (#209)
+    // --------------------------------------------------------------------
+
+    /// Create an agreement of up to 12 stages, funding ALL stages atomically.
+    /// Contractors cannot withdraw without an explicit merchant-approved release.
+    pub fn create_milestone_project(
+        env: Env,
+        merchant: Address,
+        contractor: Address,
+        token: Address,
+        input_stages: Vec<MilestoneInput>,
+    ) -> u64 {
+        merchant.require_auth();
+        assert!(!input_stages.is_empty() && input_stages.len() <= 12, "invalid milestone count");
+        assert!(merchant != contractor, "merchant and contractor must differ");
+        let mut stages = Vec::<MilestoneStage>::new(&env);
+        let mut total = 0i128;
+        for input in input_stages.iter() {
+            assert!(input.title.len() > 0 && input.title.len() <= 120, "invalid title");
+            assert!(input.deliverable_url.len() <= 512, "deliverable URL too long");
+            assert!(input.amount > 0, "milestone amount must be positive");
+            assert!(input.due_timestamp > env.ledger().timestamp(), "milestone due date must be in future");
+            total = total.checked_add(input.amount).expect("milestone amount overflow");
+            stages.push_back(MilestoneStage {
+                title: input.title,
+                deliverable_url: input.deliverable_url,
+                amount: input.amount,
+                due_timestamp: input.due_timestamp,
+                proof_url: String::from_str(&env, ""),
+                review_feedback: String::from_str(&env, ""),
+                submitted: false,
+                released: false,
+            });
+        }
+        let id: u64 = env.storage().instance().get(&DataKey::NextMilestoneProjectId).unwrap_or(0);
+        env.storage().instance().set(&DataKey::NextMilestoneProjectId,
+            &id.checked_add(1).expect("project id overflow"));
+        token::Client::new(&env, &token).transfer(
+            &merchant, &env.current_contract_address(), &total
+        );
+        let project = MilestoneProject {
+            id, merchant: merchant.clone(), contractor: contractor.clone(), token,
+            escrowed: total, released_amount: 0, stages,
+        };
+        let key = DataKey::MilestoneProject(id);
+        env.storage().persistent().set(&key, &project);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.events().publish((Symbol::new(&env, "milestones_created"), id), (merchant, contractor, total));
+        id
+    }
+
+    /// The registered contractor submits proof; merchant remains the only
+    /// actor who can move escrowed funds. A revised proof reopens review.
+    pub fn submit_milestone_deliverable(
+        env: Env, contractor: Address, project_id: u64, stage_index: u32, proof_url: String
+    ) {
+        contractor.require_auth();
+        assert!(proof_url.len() > 0 && proof_url.len() <= 512, "invalid proof URL");
+        let key = DataKey::MilestoneProject(project_id);
+        let mut project: MilestoneProject = env.storage().persistent().get(&key).expect("unknown project");
+        assert_eq!(project.contractor, contractor, "only assigned contractor may submit");
+        let mut stage = project.stages.get(stage_index).expect("unknown milestone");
+        assert!(!stage.released, "milestone already released");
+        stage.proof_url = proof_url;
+        stage.review_feedback = String::from_str(&env, "");
+        stage.submitted = true;
+        project.stages.set(stage_index, stage);
+        env.storage().persistent().set(&key, &project);
+        env.events().publish((Symbol::new(&env, "milestone_submitted"), project_id), stage_index);
+    }
+
+    /// Merchant feedback explicitly blocks release until a new proof is submitted.
+    pub fn request_milestone_changes(
+        env: Env, merchant: Address, project_id: u64, stage_index: u32, feedback: String
+    ) {
+        merchant.require_auth();
+        assert!(feedback.len() > 0 && feedback.len() <= 512, "invalid review feedback");
+        let key = DataKey::MilestoneProject(project_id);
+        let mut project: MilestoneProject = env.storage().persistent().get(&key).expect("unknown project");
+        assert_eq!(project.merchant, merchant, "only project merchant may review");
+        let mut stage = project.stages.get(stage_index).expect("unknown milestone");
+        assert!(!stage.released && stage.submitted, "milestone not under review");
+        stage.submitted = false;
+        stage.review_feedback = feedback;
+        project.stages.set(stage_index, stage);
+        env.storage().persistent().set(&key, &project);
+        env.events().publish((Symbol::new(&env, "milestone_changes"), project_id), stage_index);
+    }
+
+    /// Freighter-signed merchant authorization releases exactly one stage.
+    /// State changes and token transfer are atomic; a failed transfer rolls back.
+    pub fn approve_and_release_milestone(
+        env: Env, merchant: Address, project_id: u64, stage_index: u32
+    ) {
+        merchant.require_auth();
+        let key = DataKey::MilestoneProject(project_id);
+        let mut project: MilestoneProject = env.storage().persistent().get(&key).expect("unknown project");
+        assert_eq!(project.merchant, merchant, "only merchant may approve");
+        let mut stage = project.stages.get(stage_index).expect("unknown milestone");
+        assert!(stage.submitted && !stage.released, "milestone is not awaiting approval");
+        // Enforce release order so later milestone approvals cannot bypass earlier stages.
+        for earlier in 0..stage_index {
+            assert!(project.stages.get(earlier).expect("earlier stage missing").released,
+                "earlier milestone must be released first");
+        }
+        stage.released = true;
+        let amount = stage.amount;
+        project.stages.set(stage_index, stage);
+        project.released_amount = project.released_amount.checked_add(amount).expect("release overflow");
+        assert!(project.released_amount <= project.escrowed, "escrow budget exceeded");
+        env.storage().persistent().set(&key, &project);
+        token::Client::new(&env, &project.token).transfer(
+            &env.current_contract_address(), &project.contractor, &amount
+        );
+        env.events().publish(
+            (Symbol::new(&env, "milestone_released"), project_id, stage_index),
+            (project.contractor, amount),
+        );
+    }
+
+    pub fn get_milestone_project(env: Env, project_id: u64) -> Option<MilestoneProject> {
+        env.storage().persistent().get(&DataKey::MilestoneProject(project_id))
     }
 
     // --------------------------------------------------------------------

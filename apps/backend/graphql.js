@@ -5,6 +5,7 @@ const { buildSubgraphSchema } = require('@apollo/subgraph');
 const { parse, GraphQLError } = require('graphql');
 const DataLoader = require('dataloader');
 const { Keypair, StrKey } = require('@stellar/stellar-sdk');
+const { parseApiKey, hashApiKey } = require('./apiKeys');
 
 const typeDefs = parse(`
   extend schema @link(url: "https://specs.apollo.dev/federation/v2.3", import: ["@key"])
@@ -50,6 +51,23 @@ const typeDefs = parse(`
   input Timeframe { from: String!, to: String! }
   type SubscriptionPage { nodes: [Subscription!]!, total: Int!, limit: Int!, offset: Int! }
   type Analytics { activeSubscribers: Int!, settledPayments: Int!, settledAmount: String!, from: String!, to: String! }
+  type PaymentSettlement {
+    id: ID!
+    merchantId: ID!
+    subscriptionId: ID
+    amount: String
+    txHash: String
+    status: String
+    eventType: String!
+    settledAt: String!
+  }
+  schema {
+    query: Query
+    subscription: SubscriptionFeed
+  }
+  type SubscriptionFeed {
+    subscriptionSettlementFeed(merchantId: ID!): PaymentSettlement!
+  }
   type Query {
     merchant(id: ID!): Merchant
     subscribers(filter: SubscriberFilter, pagination: Pagination): SubscriptionPage!
@@ -130,6 +148,17 @@ const subscribers = (_, { filter, pagination: input }, ctx) => ctx.loaders.subsc
 });
 
 const resolvers = {
+    SubscriptionFeed: {
+        subscriptionSettlementFeed: {
+            subscribe: (_, { merchantId }, ctx) => {
+                if (!ctx.merchant || ctx.merchant.id !== merchantId) {
+                    throw new GraphQLError('Forbidden merchant stream', { extensions: { code: 'FORBIDDEN' } });
+                }
+                return ctx.eventBus.subscribe(merchantId);
+            },
+            resolve: (source) => source.subscriptionSettlementFeed,
+        },
+    },
     Query: {
         merchant: (_, { id }, ctx) => ctx.loaders.merchant.load(uuid(id)),
         subscribers,
@@ -206,7 +235,8 @@ function registerGraphql(app, getSupabase, authenticateMerchant) {
             next();
         } catch { res.status(401).json({ error: 'Wallet authentication failed' }); }
     };
-    const server = new ApolloServer({ schema: buildSubgraphSchema([{ typeDefs, resolvers }]),
+    const schema = buildSubgraphSchema([{ typeDefs, resolvers }]);
+    const server = new ApolloServer({ schema,
         includeStacktraceInErrorResponses: false,
         plugins: [{ async requestDidStart() { return { async didResolveOperation({ document }) {
             let fields = 0;
@@ -233,6 +263,42 @@ function registerGraphql(app, getSupabase, authenticateMerchant) {
     app.use('/graphql', authenticate, async (req, res, next) => {
         try { await ready; return middleware(req, res, next); } catch (error) { next(error); }
     });
+    // Authentication is required at WebSocket connect time, before any
+    // subscription operation can receive merchant events.
+    server.attachWebsocket = (httpServer) => {
+        const { WebSocketServer } = require('ws');
+        const { useServer } = require('graphql-ws/use/ws');
+        const wsServer = new WebSocketServer({ server: httpServer, path: '/graphql' });
+        const cleanup = useServer({
+            schema,
+            keepAlive: 12000,
+            onConnect: async (ctx) => {
+                const header = ctx.connectionParams?.authorization || ctx.connectionParams?.Authorization;
+                const token = typeof header === 'string' && /^Bearer\s+(\S+)$/i.exec(header)?.[1];
+                const parsed = token && parseApiKey(token);
+                if (!parsed) throw new Error('Authentication required');
+                const supabase = getSupabase();
+                if (!supabase) throw new Error('Authentication service unavailable');
+                const { data: key, error } = await supabase.from('api_keys')
+                    .select('key_prefix,environment,revoked_at,merchants(id,name,wallet_address)')
+                    .eq('key_hash', hashApiKey(token)).maybeSingle();
+                if (error || !key || key.revoked_at || !key.merchants ||
+                    key.key_prefix !== parsed.prefix || key.environment !== parsed.environment) {
+                    throw new Error('Invalid or revoked API key');
+                }
+                ctx.extra.merchant = key.merchants;
+            },
+            context: (ctx) => ({
+                merchant: ctx.extra.merchant,
+                eventBus: app.locals.paymentEventBus,
+            }),
+        }, wsServer);
+        server.closeWebsocket = async () => {
+            await cleanup.dispose();
+            await new Promise((resolve) => wsServer.close(resolve));
+        };
+        return wsServer;
+    };
     return server;
 }
 

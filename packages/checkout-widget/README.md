@@ -80,3 +80,16 @@ window.addEventListener('message', ({ data, origin }) => {
   if (data.type === 'orbit:subscribed') provisionCustomer(data.planId, data.txHash, origin);
 });
 ```
+
+
+## Desktop-to-mobile QR handover (#210)
+
+The checkout now offers **Scan with Mobile Wallet** alongside browser wallet selection. It opens a server-backed session with 24 bytes of cryptographically secure randomness and a strict five-minute expiry. The QR contains a URL back to the **same live checkout page**, with an `orbit_handover` query parameter. The widget on the mobile page reloads the plan from the server, letting the customer connect using a supported Stellar mobile DApp browser (e.g. the LOBSTR app browser or Albedo mobile flow).
+
+**Integration requirement:** The QR's destination must be reachable from a phone, must render the same `<OrbitCheckout />` widget, and must be able to access the Merchant API using HTTPS. An `http://localhost` merchant page works only for local single-device testing. This is a web handover, not a fabricated WalletConnect pairing or unsupported wallet-native transaction URI.
+
+After mobile wallet signing succeeds, the API first records a subscription, then `POST /handover/sessions/:id/complete` checks the Stellar RPC transaction **SUCCESS**, its ledger, vault-creation event, token, payout amount, interval, merchant, and customer address against the server's plan and subscription records. Only then does the desktop polling flow show a GSAP-animated receipt. Session state expires after five minutes; the widget stops polling cleanly.
+
+The backend requires `ORBIT_CONTRACT_ID`, `USDC_CONTRACT_ID`, `SOROBAN_RPC_URL` and a working payment database. Set `REDIS_URL` in horizontally scaled environments so independent API replicas share the expiring session state. Otherwise the built-in memory fallback is **single-process only**.
+
+Run `npm test` (unit tests) and `npm run build` for this package. Handover approval requires a real wallet transaction; offline/demo states cannot mark a session confirmed.
