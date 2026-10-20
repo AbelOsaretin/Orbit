@@ -61,6 +61,8 @@ export function createFakeSupabase(seed = {}, { unique = {} } = {}) {
             delete: () => { op = 'delete'; return builder; },
             eq: (path, value) => { filters.push((row) => get(row, path) === value); return builder; },
             neq: (path, value) => { filters.push((row) => get(row, path) !== value); return builder; },
+            gte: (path, value) => { filters.push((row) => get(row, path) >= value); return builder; },
+            lte: (path, value) => { filters.push((row) => get(row, path) <= value); return builder; },
             in: (path, values) => { filters.push((row) => values.includes(get(row, path))); return builder; },
             is: (path, value) => { filters.push((row) => (get(row, path) ?? null) === value); return builder; },
             order: () => builder,
