@@ -118,14 +118,14 @@ async function validateWebhookURL(url, enforceHTTPS = true) {
     throw new Error("Invalid URL format");
   }
 
-  // Enforce HTTPS in production
-  if (enforceHTTPS && parsedURL.protocol !== "https:") {
-    throw new Error("Webhook URLs must use HTTPS protocol in production");
-  }
-
   // Reject file://, ftp://, gopher://, etc.
   if (!["http:", "https:"].includes(parsedURL.protocol)) {
     throw new Error("Only HTTP/HTTPS protocols are allowed");
+  }
+
+  // Enforce HTTPS in production
+  if (enforceHTTPS && parsedURL.protocol !== "https:") {
+    throw new Error("Webhook URLs must use HTTPS protocol in production");
   }
 
   // Reject URLs with authentication credentials

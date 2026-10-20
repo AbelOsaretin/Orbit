@@ -1,6 +1,6 @@
-const { describe, it, expect, beforeEach, jest } = require("@jest/globals");
-const dns = require("dns").promises;
-const {
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { promises as dns } from 'dns';
+import {
   validateWebhookURL,
   dispatchSecureWebhook,
   isPrivateOrReservedIP,
@@ -8,19 +8,15 @@ const {
   isPrivateIPv6,
   resolveHostname,
   testWebhookSecurity,
-} = require("../webhook-security");
-
-// Mock DNS module
-jest.mock("dns", () => ({
-  promises: {
-    resolve4: jest.fn(),
-    resolve6: jest.fn(),
-  },
-}));
+} from '../webhook-security.js';
 
 describe("Webhook Security Scanner (#177)", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    // Spy on the shared dns.promises object so both this test and the code
+    // under test observe the same mocked resolver functions.
+    vi.restoreAllMocks();
+    vi.spyOn(dns, "resolve4");
+    vi.spyOn(dns, "resolve6");
   });
 
   describe("isPrivateIPv4", () => {
@@ -178,7 +174,7 @@ describe("Webhook Security Scanner (#177)", () => {
     let mockFetch;
 
     beforeEach(() => {
-      mockFetch = jest.fn();
+      mockFetch = vi.fn();
       dns.resolve4.mockResolvedValue(["151.101.1.69"]);
     });
 
@@ -242,7 +238,12 @@ describe("Webhook Security Scanner (#177)", () => {
     });
 
     it("should timeout long-running requests", async () => {
-      mockFetch.mockImplementation(() => new Promise(() => {})); // Never resolves
+      // Behaves like real fetch: rejects when the abort signal fires
+      mockFetch.mockImplementation((_, { signal }) => new Promise((_, reject) => {
+        signal.addEventListener("abort", () =>
+          reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" })),
+        );
+      }));
 
       await expect(
         dispatchSecureWebhook(
@@ -317,7 +318,7 @@ describe("Webhook Security Scanner (#177)", () => {
       // Dispatch time: DNS rebinding attack - now resolves to private IP
       dns.resolve4.mockResolvedValue(["127.0.0.1"]);
 
-      const mockFetch = jest.fn();
+      const mockFetch = vi.fn();
       await expect(
         dispatchSecureWebhook(
           "https://evil.example.com",

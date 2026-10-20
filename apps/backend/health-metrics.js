@@ -22,7 +22,16 @@ function registerHealthMetrics(app, options) {
     const obs = createObservability(options); app.locals.healthMetricsRegistered = true;
     app.use((req, res, next) => { const started = process.hrtime.bigint(); res.on('finish', () => obs.httpLatency.observe({ method: req.method, route: req.route?.path || req.path, status: String(res.statusCode) }, Number(process.hrtime.bigint() - started) / 1e9)); next(); });
     app.get('/health/live', (req, res) => res.json({ live: true }));
-    app.get('/health/ready', async (req, res) => { const status = await obs.ready(); res.status(status.ready ? 200 : 503).json(status); });
+    app.get('/health/ready', async (req, res) => {
+        const indexer = app.locals.ledgerIndexer;
+        if (!indexer) return res.status(503).json({ ready: false, checks: { ledger_indexer: 'missing' } });
+        try {
+            const status = await indexer.health();
+            return res.status(status.ready ? 200 : 503).json(status);
+        } catch (e) {
+            return res.status(503).json({ ready: false, checks: { ledger_indexer: e.message } });
+        }
+    });
     app.get('/metrics', async (req, res) => { await obs.collectBusinessMetrics(); res.set('Content-Type', obs.registry.contentType); res.send(await obs.registry.metrics()); });
     return obs;
 }
