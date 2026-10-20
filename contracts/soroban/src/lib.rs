@@ -48,6 +48,12 @@ pub const REVENUE_ACC_SCALE: i128 = 1_000_000_000_000;
 /// Keeps revenue-pool creation and claim lookups within predictable resource bounds.
 pub const MAX_REVENUE_POOL_SHAREHOLDERS: u32 = 100;
 
+/// Upper bound on merchant-configured loyalty tiers (#180).
+pub const MAX_LOYALTY_TIERS: u32 = 10;
+
+/// Basis-point denominator for loyalty discounts (#180).
+pub const BPS_DENOMINATOR: i128 = 10_000;
+
 /// Maximum elastic allowance above a metered vault's baseline limit.
 pub const MAX_OVERDRAFT_PERCENTAGE: u32 = 20;
 
@@ -209,6 +215,10 @@ pub enum DataKey {
     BountyCommit(u64, Address),
     NextMilestoneProjectId,
     MilestoneProject(u64),
+    /// Multi-token basket subscription vault (#166)
+    BasketVault(Address, Address),
+    /// Loyalty token escrow for one subscriber (#180)
+    LoyaltyStake(Address),
 }
 
 /// Escrowed competitive bounty; creator cannot withdraw while it is claimable.
@@ -241,7 +251,10 @@ pub fn bounty_claim_digest(
     salt: &BytesN<32>,
 ) -> BytesN<32> {
     use soroban_sdk::xdr::ToXdr;
-    assert!(proof.len() > 0 && proof.len() <= 4096, "invalid proof length");
+    assert!(
+        proof.len() > 0 && proof.len() <= 4096,
+        "invalid proof length"
+    );
     let mut data = Bytes::from_slice(env, b"orbit:bounty:claim:v1");
     data.append(&claimant.clone().to_xdr(env));
     data.extend_from_array(&bounty_id.to_be_bytes());
@@ -286,6 +299,35 @@ pub struct MilestoneProject {
     pub escrowed: i128,
     pub released_amount: i128,
     pub stages: Vec<MilestoneStage>,
+}
+
+/// Multi-token basket subscription (#166): each billing interval pulls every
+/// token in `tokens` for its matching `amounts_per_interval` entry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BasketVaultData {
+    pub tokens: Vec<Address>,
+    pub amounts_per_interval: Vec<i128>,
+    pub interval_seconds: u64,
+    pub last_pull_timestamp: u64,
+}
+
+/// Loyalty discount tier (#180): subscribers staking at least `min_lock_amount`
+/// receive `discount_bps` basis points off recurring pulls.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoyaltyTier {
+    pub min_lock_amount: i128,
+    pub discount_bps: u32,
+}
+
+/// Loyalty tokens locked in contract escrow for one subscriber (#180).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoyaltyStake {
+    pub token: Address,
+    pub amount: i128,
+    pub lock_until: u64,
 }
 
 /// Storage key for a metered (usage-based) vault (#46). An enum on purpose:
@@ -420,6 +462,10 @@ pub enum FeatureKey {
     Elasticity(Address, Address),
     GasSubsidy(Address),
     YieldStrategy,
+    /// Per-user meta-transaction replay nonce (#207)
+    UserNonce(Address),
+    /// Merchant-configured loyalty discount tiers (#180)
+    LoyaltyTiers(Address),
 }
 
 // ----------------------------------------------------------------------------
@@ -739,6 +785,42 @@ fn clear_recovery_state(env: &Env, user: &Address, merchant: &Address) {
     env.storage()
         .persistent()
         .remove(&FeatureKey::RecoveryRequest(user.clone(), merchant.clone()));
+}
+
+/// Removes the fixed-interval and/or metered vault for (user, merchant) and
+/// emits `vault_cancelled`. Shared by direct and delegated cancellation.
+fn remove_vault(env: &Env, user: &Address, merchant: &Address) {
+    let key = vault_key(user, merchant);
+    let metered_key = MeteredVaultKey::Vault(user.clone(), merchant.clone());
+
+    let has_fixed = env.storage().persistent().has(&key);
+    let has_metered = env.storage().persistent().has(&metered_key);
+    assert!(has_fixed || has_metered, "Vault does not exist");
+
+    if has_fixed {
+        let vault: VaultData = env.storage().persistent().get(&key).expect("Vault missing");
+        deactivate_badge(env, user, merchant, vault.interval_seconds);
+        env.storage().persistent().remove(&key);
+        env.storage()
+            .persistent()
+            .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
+        env.storage()
+            .persistent()
+            .remove(&SubscriptionKey::EscrowPolicy(
+                user.clone(),
+                merchant.clone(),
+            ));
+    }
+    if has_metered {
+        env.storage().persistent().remove(&metered_key);
+        env.storage()
+            .persistent()
+            .remove(&FeatureKey::Elasticity(user.clone(), merchant.clone()));
+    }
+    clear_recovery_state(env, user, merchant);
+
+    env.events()
+        .publish((Symbol::new(env, "vault_cancelled"), user, merchant), ());
 }
 
 // ----------------------------------------------------------------------------
@@ -1845,39 +1927,7 @@ impl OrbitContract {
     /// pair; panics if neither exists.
     pub fn cancel_vault(env: Env, user: Address, merchant: Address) {
         user.require_auth();
-
-        let key = vault_key(&user, &merchant);
-        let metered_key = MeteredVaultKey::Vault(user.clone(), merchant.clone());
-
-        let has_fixed = env.storage().persistent().has(&key);
-        let has_metered = env.storage().persistent().has(&metered_key);
-        assert!(has_fixed || has_metered, "Vault does not exist");
-
-        if has_fixed {
-            let vault: VaultData = env.storage().persistent().get(&key).expect("Vault missing");
-            deactivate_badge(&env, &user, &merchant, vault.interval_seconds);
-            env.storage().persistent().remove(&key);
-            env.storage()
-                .persistent()
-                .remove(&SubscriptionKey::Swap(user.clone(), merchant.clone()));
-            env.storage()
-                .persistent()
-                .remove(&SubscriptionKey::EscrowPolicy(
-                    user.clone(),
-                    merchant.clone(),
-                ));
-        }
-        if has_metered {
-            env.storage().persistent().remove(&metered_key);
-            env.storage()
-                .persistent()
-                .remove(&FeatureKey::Elasticity(user.clone(), merchant.clone()));
-        }
-        clear_recovery_state(&env, &user, &merchant);
-
-        // Emit contract event
-        env.events()
-            .publish((Symbol::new(&env, "vault_cancelled"), user, merchant), ());
+        remove_vault(&env, &user, &merchant);
     }
 
     pub fn merchant_cancel_vault(env: Env, merchant: Address, user: Address) {
@@ -2093,6 +2143,24 @@ impl OrbitContract {
             "Pull already settled in this billing cycle"
         );
 
+        // Loyalty discount (#180): an active stake qualifies for the merchant's
+        // best matching tier; the discounted amount is what actually settles.
+        let base_amount = vault.amount_per_interval;
+        let discount_bps = loyalty_discount_bps(&env, &user, &merchant);
+        if discount_bps > 0 {
+            let settled = base_amount - base_amount * i128::from(discount_bps) / BPS_DENOMINATOR;
+            assert!(settled > 0, "Loyalty discount would zero out the payment");
+            vault.amount_per_interval = settled;
+            env.events().publish(
+                (
+                    Symbol::new(&env, "loyalty_discount_applied"),
+                    user.clone(),
+                    merchant.clone(),
+                ),
+                (discount_bps, settled),
+            );
+        }
+
         let policy_key = SubscriptionKey::EscrowPolicy(user.clone(), merchant.clone());
         let policy: Option<EscrowPolicy> = env.storage().persistent().get(&policy_key);
         let recipient = if policy.is_some() {
@@ -2132,6 +2200,8 @@ impl OrbitContract {
         vault.last_pull_timestamp = current_time;
         vault.payment_status = PAYMENT_ACTIVE;
         vault.pull_sequence = cycle_index;
+        // Persist the full recurring charge; only this settlement was discounted.
+        vault.amount_per_interval = base_amount;
         let amount_per_interval = vault.amount_per_interval;
         let interval_seconds = vault.interval_seconds;
         save_vault(&env, &key, &vault);
@@ -2801,9 +2871,20 @@ impl OrbitContract {
             expires_at_ledger - now <= MIN_TTL_LEDGERS,
             "bounty deadline exceeds storage lifetime"
         );
-        let id: u64 = env.storage().instance().get(&DataKey::NextBountyId).unwrap_or(0);
-        env.storage().instance().set(&DataKey::NextBountyId, &(id.checked_add(1).expect("bounty id overflow")));
-        token::Client::new(&env, &token).transfer(&creator, &env.current_contract_address(), &amount);
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextBountyId)
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::NextBountyId,
+            &(id.checked_add(1).expect("bounty id overflow")),
+        );
+        token::Client::new(&env, &token).transfer(
+            &creator,
+            &env.current_contract_address(),
+            &amount,
+        );
         let bounty = CompetitiveBounty {
             creator: creator.clone(),
             token,
@@ -2815,9 +2896,14 @@ impl OrbitContract {
         };
         let key = DataKey::Bounty(id);
         env.storage().persistent().set(&key, &bounty);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
-        env.events().publish((Symbol::new(&env, "bounty_created"), id), (creator, amount));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.events()
+            .publish((Symbol::new(&env, "bounty_created"), id), (creator, amount));
         id
     }
 
@@ -2830,19 +2916,37 @@ impl OrbitContract {
         commitment_hash: BytesN<32>,
     ) {
         claimant.require_auth();
-        let bounty: CompetitiveBounty = env.storage().persistent()
-            .get(&DataKey::Bounty(bounty_id)).expect("unknown bounty");
+        let bounty: CompetitiveBounty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bounty(bounty_id))
+            .expect("unknown bounty");
         let now = env.ledger().sequence();
-        assert!(!bounty.cancelled && bounty.claimed_by.is_none(), "bounty unavailable");
-        assert!(now.saturating_add(BOUNTY_REVEAL_DELAY) <= bounty.expires_at_ledger, "too late to commit");
+        assert!(
+            !bounty.cancelled && bounty.claimed_by.is_none(),
+            "bounty unavailable"
+        );
+        assert!(
+            now.saturating_add(BOUNTY_REVEAL_DELAY) <= bounty.expires_at_ledger,
+            "too late to commit"
+        );
         let key = DataKey::BountyCommit(bounty_id, claimant.clone());
-        assert!(!env.storage().persistent().has(&key), "commitment already exists");
-        env.storage().persistent().set(&key, &BountyCommitment {
-            digest: commitment_hash,
-            ledger: now,
-        });
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
-        env.events().publish((Symbol::new(&env, "bounty_committed"), bounty_id), claimant);
+        assert!(
+            !env.storage().persistent().has(&key),
+            "commitment already exists"
+        );
+        env.storage().persistent().set(
+            &key,
+            &BountyCommitment {
+                digest: commitment_hash,
+                ledger: now,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.events()
+            .publish((Symbol::new(&env, "bounty_committed"), bounty_id), claimant);
     }
 
     /// A reveal cannot execute until five *later* ledgers have closed.
@@ -2856,14 +2960,23 @@ impl OrbitContract {
     ) {
         claimant.require_auth();
         let key = DataKey::Bounty(bounty_id);
-        let mut bounty: CompetitiveBounty =
-            env.storage().persistent().get(&key).expect("unknown bounty");
-        assert!(!bounty.cancelled && bounty.claimed_by.is_none(), "bounty unavailable");
+        let mut bounty: CompetitiveBounty = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("unknown bounty");
+        assert!(
+            !bounty.cancelled && bounty.claimed_by.is_none(),
+            "bounty unavailable"
+        );
         let now = env.ledger().sequence();
         assert!(now <= bounty.expires_at_ledger, "bounty expired");
         let claim_key = DataKey::BountyCommit(bounty_id, claimant.clone());
-        let commitment: BountyCommitment =
-            env.storage().persistent().get(&claim_key).expect("claimant did not commit");
+        let commitment: BountyCommitment = env
+            .storage()
+            .persistent()
+            .get(&claim_key)
+            .expect("claimant did not commit");
         assert!(
             now >= commitment.ledger.saturating_add(BOUNTY_REVEAL_DELAY),
             "reveal is too early"
@@ -2883,24 +2996,39 @@ impl OrbitContract {
         env.storage().persistent().set(&key, &bounty);
         env.storage().persistent().remove(&claim_key);
         token::Client::new(&env, &bounty.token).transfer(
-            &env.current_contract_address(), &claimant, &bounty.amount
+            &env.current_contract_address(),
+            &claimant,
+            &bounty.amount,
         );
-        env.events().publish((Symbol::new(&env, "bounty_claimed"), bounty_id),
-            (claimant, bounty.amount));
+        env.events().publish(
+            (Symbol::new(&env, "bounty_claimed"), bounty_id),
+            (claimant, bounty.amount),
+        );
     }
 
     /// Reclaim only when a bounty expires without a winner.
     pub fn reclaim_expired_bounty(env: Env, bounty_id: u64) {
         let key = DataKey::Bounty(bounty_id);
-        let mut bounty: CompetitiveBounty =
-            env.storage().persistent().get(&key).expect("unknown bounty");
+        let mut bounty: CompetitiveBounty = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("unknown bounty");
         bounty.creator.require_auth();
-        assert!(env.ledger().sequence() > bounty.expires_at_ledger, "bounty not expired");
-        assert!(!bounty.cancelled && bounty.claimed_by.is_none(), "bounty unavailable");
+        assert!(
+            env.ledger().sequence() > bounty.expires_at_ledger,
+            "bounty not expired"
+        );
+        assert!(
+            !bounty.cancelled && bounty.claimed_by.is_none(),
+            "bounty unavailable"
+        );
         bounty.cancelled = true;
         env.storage().persistent().set(&key, &bounty);
         token::Client::new(&env, &bounty.token).transfer(
-            &env.current_contract_address(), &bounty.creator, &bounty.amount
+            &env.current_contract_address(),
+            &bounty.creator,
+            &bounty.amount,
         );
     }
 
@@ -2922,16 +3050,33 @@ impl OrbitContract {
         input_stages: Vec<MilestoneInput>,
     ) -> u64 {
         merchant.require_auth();
-        assert!(!input_stages.is_empty() && input_stages.len() <= 12, "invalid milestone count");
-        assert!(merchant != contractor, "merchant and contractor must differ");
+        assert!(
+            !input_stages.is_empty() && input_stages.len() <= 12,
+            "invalid milestone count"
+        );
+        assert!(
+            merchant != contractor,
+            "merchant and contractor must differ"
+        );
         let mut stages = Vec::<MilestoneStage>::new(&env);
         let mut total = 0i128;
         for input in input_stages.iter() {
-            assert!(input.title.len() > 0 && input.title.len() <= 120, "invalid title");
-            assert!(input.deliverable_url.len() <= 512, "deliverable URL too long");
+            assert!(
+                input.title.len() > 0 && input.title.len() <= 120,
+                "invalid title"
+            );
+            assert!(
+                input.deliverable_url.len() <= 512,
+                "deliverable URL too long"
+            );
             assert!(input.amount > 0, "milestone amount must be positive");
-            assert!(input.due_timestamp > env.ledger().timestamp(), "milestone due date must be in future");
-            total = total.checked_add(input.amount).expect("milestone amount overflow");
+            assert!(
+                input.due_timestamp > env.ledger().timestamp(),
+                "milestone due date must be in future"
+            );
+            total = total
+                .checked_add(input.amount)
+                .expect("milestone amount overflow");
             stages.push_back(MilestoneStage {
                 title: input.title,
                 deliverable_url: input.deliverable_url,
@@ -2943,34 +3088,68 @@ impl OrbitContract {
                 released: false,
             });
         }
-        let id: u64 = env.storage().instance().get(&DataKey::NextMilestoneProjectId).unwrap_or(0);
-        env.storage().instance().set(&DataKey::NextMilestoneProjectId,
-            &id.checked_add(1).expect("project id overflow"));
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextMilestoneProjectId)
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::NextMilestoneProjectId,
+            &id.checked_add(1).expect("project id overflow"),
+        );
         token::Client::new(&env, &token).transfer(
-            &merchant, &env.current_contract_address(), &total
+            &merchant,
+            &env.current_contract_address(),
+            &total,
         );
         let project = MilestoneProject {
-            id, merchant: merchant.clone(), contractor: contractor.clone(), token,
-            escrowed: total, released_amount: 0, stages,
+            id,
+            merchant: merchant.clone(),
+            contractor: contractor.clone(),
+            token,
+            escrowed: total,
+            released_amount: 0,
+            stages,
         };
         let key = DataKey::MilestoneProject(id);
         env.storage().persistent().set(&key, &project);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
-        env.storage().instance().extend_ttl(TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
-        env.events().publish((Symbol::new(&env, "milestones_created"), id), (merchant, contractor, total));
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.events().publish(
+            (Symbol::new(&env, "milestones_created"), id),
+            (merchant, contractor, total),
+        );
         id
     }
 
     /// The registered contractor submits proof; merchant remains the only
     /// actor who can move escrowed funds. A revised proof reopens review.
     pub fn submit_milestone_deliverable(
-        env: Env, contractor: Address, project_id: u64, stage_index: u32, proof_url: String
+        env: Env,
+        contractor: Address,
+        project_id: u64,
+        stage_index: u32,
+        proof_url: String,
     ) {
         contractor.require_auth();
-        assert!(proof_url.len() > 0 && proof_url.len() <= 512, "invalid proof URL");
+        assert!(
+            proof_url.len() > 0 && proof_url.len() <= 512,
+            "invalid proof URL"
+        );
         let key = DataKey::MilestoneProject(project_id);
-        let mut project: MilestoneProject = env.storage().persistent().get(&key).expect("unknown project");
-        assert_eq!(project.contractor, contractor, "only assigned contractor may submit");
+        let mut project: MilestoneProject = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("unknown project");
+        assert_eq!(
+            project.contractor, contractor,
+            "only assigned contractor may submit"
+        );
         let mut stage = project.stages.get(stage_index).expect("unknown milestone");
         assert!(!stage.released, "milestone already released");
         stage.proof_url = proof_url;
@@ -2978,60 +3157,113 @@ impl OrbitContract {
         stage.submitted = true;
         project.stages.set(stage_index, stage);
         env.storage().persistent().set(&key, &project);
-        env.events().publish((Symbol::new(&env, "milestone_submitted"), project_id), stage_index);
+        env.events().publish(
+            (Symbol::new(&env, "milestone_submitted"), project_id),
+            stage_index,
+        );
     }
 
     /// Merchant feedback explicitly blocks release until a new proof is submitted.
     pub fn request_milestone_changes(
-        env: Env, merchant: Address, project_id: u64, stage_index: u32, feedback: String
+        env: Env,
+        merchant: Address,
+        project_id: u64,
+        stage_index: u32,
+        feedback: String,
     ) {
         merchant.require_auth();
-        assert!(feedback.len() > 0 && feedback.len() <= 512, "invalid review feedback");
+        assert!(
+            feedback.len() > 0 && feedback.len() <= 512,
+            "invalid review feedback"
+        );
         let key = DataKey::MilestoneProject(project_id);
-        let mut project: MilestoneProject = env.storage().persistent().get(&key).expect("unknown project");
-        assert_eq!(project.merchant, merchant, "only project merchant may review");
+        let mut project: MilestoneProject = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("unknown project");
+        assert_eq!(
+            project.merchant, merchant,
+            "only project merchant may review"
+        );
         let mut stage = project.stages.get(stage_index).expect("unknown milestone");
-        assert!(!stage.released && stage.submitted, "milestone not under review");
+        assert!(
+            !stage.released && stage.submitted,
+            "milestone not under review"
+        );
         stage.submitted = false;
         stage.review_feedback = feedback;
         project.stages.set(stage_index, stage);
         env.storage().persistent().set(&key, &project);
-        env.events().publish((Symbol::new(&env, "milestone_changes"), project_id), stage_index);
+        env.events().publish(
+            (Symbol::new(&env, "milestone_changes"), project_id),
+            stage_index,
+        );
     }
 
     /// Freighter-signed merchant authorization releases exactly one stage.
     /// State changes and token transfer are atomic; a failed transfer rolls back.
     pub fn approve_and_release_milestone(
-        env: Env, merchant: Address, project_id: u64, stage_index: u32
+        env: Env,
+        merchant: Address,
+        project_id: u64,
+        stage_index: u32,
     ) {
         merchant.require_auth();
         let key = DataKey::MilestoneProject(project_id);
-        let mut project: MilestoneProject = env.storage().persistent().get(&key).expect("unknown project");
+        let mut project: MilestoneProject = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("unknown project");
         assert_eq!(project.merchant, merchant, "only merchant may approve");
         let mut stage = project.stages.get(stage_index).expect("unknown milestone");
-        assert!(stage.submitted && !stage.released, "milestone is not awaiting approval");
+        assert!(
+            stage.submitted && !stage.released,
+            "milestone is not awaiting approval"
+        );
         // Enforce release order so later milestone approvals cannot bypass earlier stages.
         for earlier in 0..stage_index {
-            assert!(project.stages.get(earlier).expect("earlier stage missing").released,
-                "earlier milestone must be released first");
+            assert!(
+                project
+                    .stages
+                    .get(earlier)
+                    .expect("earlier stage missing")
+                    .released,
+                "earlier milestone must be released first"
+            );
         }
         stage.released = true;
         let amount = stage.amount;
         project.stages.set(stage_index, stage);
-        project.released_amount = project.released_amount.checked_add(amount).expect("release overflow");
-        assert!(project.released_amount <= project.escrowed, "escrow budget exceeded");
+        project.released_amount = project
+            .released_amount
+            .checked_add(amount)
+            .expect("release overflow");
+        assert!(
+            project.released_amount <= project.escrowed,
+            "escrow budget exceeded"
+        );
         env.storage().persistent().set(&key, &project);
         token::Client::new(&env, &project.token).transfer(
-            &env.current_contract_address(), &project.contractor, &amount
+            &env.current_contract_address(),
+            &project.contractor,
+            &amount,
         );
         env.events().publish(
-            (Symbol::new(&env, "milestone_released"), project_id, stage_index),
+            (
+                Symbol::new(&env, "milestone_released"),
+                project_id,
+                stage_index,
+            ),
             (project.contractor, amount),
         );
     }
 
     pub fn get_milestone_project(env: Env, project_id: u64) -> Option<MilestoneProject> {
-        env.storage().persistent().get(&DataKey::MilestoneProject(project_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::MilestoneProject(project_id))
     }
 
     // --------------------------------------------------------------------
@@ -3489,7 +3721,10 @@ impl OrbitContract {
         liquidity_buffer: i128,
     ) {
         admin.require_auth();
-        assert!(liquidity_buffer >= 0, "Liquidity buffer must be non-negative");
+        assert!(
+            liquidity_buffer >= 0,
+            "Liquidity buffer must be non-negative"
+        );
 
         let key = FeatureKey::YieldStrategy;
         let config = YieldStrategyConfig {
@@ -3606,12 +3841,11 @@ impl OrbitContract {
             .as_ref()
             .expect("No yield pool configured");
         let contract_addr = env.current_contract_address();
-        let pool_client = LendingPoolClient::new(&env, &config.token);
+        let pool = LendingPoolClient::new(&env, pool_address);
 
         // Query the contract's balance in the lending pool
-        let pool_balance = pool_client.balance_of(&config.token, &contract_addr);
+        let pool_balance = pool.balance_of(&config.token, &contract_addr);
         if pool_balance > 0 {
-            let pool = LendingPoolClient::new(&env, pool_address);
             let recovered = pool.withdraw(&config.token, &pool_balance, &contract_addr);
 
             config.total_deployed = 0;
@@ -3626,10 +3860,399 @@ impl OrbitContract {
 
     /// Read the current yield strategy configuration. No authorization required.
     pub fn get_yield_strategy(env: Env) -> Option<YieldStrategyConfig> {
+        env.storage().persistent().get(&FeatureKey::YieldStrategy)
+    }
+
+    // --------------------------------------------------------------------
+    // MULTI-TOKEN BASKET BILLING (#166)
+    // --------------------------------------------------------------------
+
+    /// Configure a multi-token subscription basket. The subscriber must approve
+    /// each token to this contract for the matching amount before pulls settle.
+    pub fn create_basket_vault(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        tokens: Vec<Address>,
+        amounts: Vec<i128>,
+        interval_seconds: u64,
+    ) {
+        user.require_auth();
+        assert!(
+            tokens.len() == amounts.len(),
+            "tokens and amounts length mismatch"
+        );
+        assert!(!tokens.is_empty(), "basket must not be empty");
+        assert!(
+            interval_seconds > 0,
+            "interval_seconds must be greater than zero"
+        );
+        for amount in amounts.iter() {
+            assert!(amount > 0, "amounts must be positive");
+        }
+
+        let key = DataKey::BasketVault(user.clone(), merchant.clone());
+        let data = BasketVaultData {
+            tokens: tokens.clone(),
+            amounts_per_interval: amounts.clone(),
+            interval_seconds,
+            last_pull_timestamp: 0,
+        };
+        env.storage().persistent().set(&key, &data);
+        let (threshold, extend_to) = calculate_ttl_params(interval_seconds);
         env.storage()
             .persistent()
-            .get(&FeatureKey::YieldStrategy)
+            .extend_ttl(&key, threshold, extend_to);
+        env.storage().instance().extend_ttl(threshold, extend_to);
+        env.events().publish(
+            (Symbol::new(&env, "basket_vault_created"), user, merchant),
+            (tokens, amounts, interval_seconds),
+        );
     }
+
+    pub fn get_basket_vault(env: Env, user: Address, merchant: Address) -> Option<BasketVaultData> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BasketVault(user, merchant))
+    }
+
+    /// Pull every token in the basket in one atomic invocation. Any single
+    /// failing transfer (insufficient allowance or balance) reverts the whole
+    /// pull, so partial basket settlement can never occur.
+    pub fn pull_basket_funds(env: Env, user: Address, merchant: Address) {
+        merchant.require_auth();
+
+        let key = DataKey::BasketVault(user.clone(), merchant.clone());
+        let mut data: BasketVaultData = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("Basket vault does not exist");
+
+        let current_time = env.ledger().timestamp();
+        if data.last_pull_timestamp != 0 {
+            assert!(
+                current_time >= data.last_pull_timestamp + data.interval_seconds,
+                "Too early to pull basket funds"
+            );
+        }
+
+        let contract = env.current_contract_address();
+        for i in 0..data.tokens.len() {
+            let token = data.tokens.get(i).unwrap();
+            let amount = data.amounts_per_interval.get(i).unwrap();
+            token::Client::new(&env, &token).transfer_from(&contract, &user, &merchant, &amount);
+        }
+
+        data.last_pull_timestamp = current_time;
+        env.storage().persistent().set(&key, &data);
+        let (threshold, extend_to) = calculate_ttl_params(data.interval_seconds);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
+        env.events().publish(
+            (Symbol::new(&env, "basket_funds_pulled"), user, merchant),
+            (current_time, data.tokens.len()),
+        );
+    }
+
+    // --------------------------------------------------------------------
+    // LOYALTY STAKING & COMMITMENT DISCOUNTS (#180)
+    // --------------------------------------------------------------------
+
+    /// Configure the loyalty tiers offered to this merchant's subscribers.
+    pub fn configure_loyalty_tiers(env: Env, merchant: Address, tiers: Vec<LoyaltyTier>) {
+        merchant.require_auth();
+        assert!(!tiers.is_empty(), "tiers must not be empty");
+        assert!(tiers.len() <= MAX_LOYALTY_TIERS, "too many loyalty tiers");
+        for tier in tiers.iter() {
+            assert!(tier.min_lock_amount > 0, "min_lock_amount must be positive");
+            assert!(
+                tier.discount_bps > 0 && tier.discount_bps <= BPS_DENOMINATOR as u32,
+                "discount_bps out of range"
+            );
+        }
+        let key = FeatureKey::LoyaltyTiers(merchant.clone());
+        env.storage().persistent().set(&key, &tiers);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.events().publish(
+            (Symbol::new(&env, "loyalty_tiers_configured"), merchant),
+            tiers,
+        );
+    }
+
+    pub fn get_loyalty_tiers(env: Env, merchant: Address) -> Option<Vec<LoyaltyTier>> {
+        env.storage()
+            .persistent()
+            .get(&FeatureKey::LoyaltyTiers(merchant))
+    }
+
+    /// Lock loyalty tokens in contract escrow until `lock_duration_seconds`
+    /// elapses. One active stake per subscriber.
+    pub fn stake_loyalty_tokens(
+        env: Env,
+        user: Address,
+        token: Address,
+        amount: i128,
+        lock_duration_seconds: u64,
+    ) {
+        user.require_auth();
+        assert!(amount > 0, "amount must be positive");
+        assert!(
+            lock_duration_seconds > 0,
+            "lock_duration_seconds must be positive"
+        );
+        let key = DataKey::LoyaltyStake(user.clone());
+        assert!(
+            !env.storage().persistent().has(&key),
+            "Loyalty stake already active"
+        );
+
+        let lock_until = env
+            .ledger()
+            .timestamp()
+            .checked_add(lock_duration_seconds)
+            .expect("Lock end overflow");
+        let contract = env.current_contract_address();
+        token::Client::new(&env, &token).transfer(&user, &contract, &amount);
+        env.storage().persistent().set(
+            &key,
+            &LoyaltyStake {
+                token: token.clone(),
+                amount,
+                lock_until,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+        env.events().publish(
+            (Symbol::new(&env, "loyalty_staked"), user),
+            (token, amount, lock_until),
+        );
+    }
+
+    /// Release locked loyalty tokens. Rejected until the lock period elapses.
+    pub fn unstake_loyalty_tokens(env: Env, user: Address) {
+        user.require_auth();
+        let key = DataKey::LoyaltyStake(user.clone());
+        let stake: LoyaltyStake = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("No loyalty stake");
+        assert!(
+            env.ledger().timestamp() >= stake.lock_until,
+            "Loyalty tokens are still locked"
+        );
+        env.storage().persistent().remove(&key);
+        let contract = env.current_contract_address();
+        token::Client::new(&env, &stake.token).transfer(&contract, &user, &stake.amount);
+        env.events().publish(
+            (Symbol::new(&env, "loyalty_unstaked"), user),
+            (stake.token, stake.amount),
+        );
+    }
+
+    pub fn get_loyalty_stake(env: Env, user: Address) -> Option<LoyaltyStake> {
+        env.storage().persistent().get(&DataKey::LoyaltyStake(user))
+    }
+
+    // --------------------------------------------------------------------
+    // DELEGATED META-TRANSACTIONS (#207)
+    // --------------------------------------------------------------------
+
+    pub fn get_user_nonce(env: Env, user: Address) -> u64 {
+        load_user_nonce(&env, &user)
+    }
+
+    /// Create a vault on behalf of `user` using a signed meta-transaction.
+    /// The signature covers contract address, chain id, the current nonce, the
+    /// function symbol, the parameters and the deadline.
+    pub fn create_vault_with_signature(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        token: Address,
+        amount_per_interval: i128,
+        interval_seconds: u64,
+        deadline: u64,
+        signature: BytesN<64>,
+    ) {
+        assert!(env.ledger().timestamp() <= deadline, "Signature expired");
+        let nonce = load_user_nonce(&env, &user);
+        let digest = create_vault_meta_digest(
+            &env,
+            &user,
+            &merchant,
+            &token,
+            amount_per_interval,
+            interval_seconds,
+            nonce,
+            deadline,
+        );
+        verify_meta_signature(&env, &user, &digest, &signature);
+        bump_user_nonce(&env, &user, nonce);
+        write_vault(
+            &env,
+            &user,
+            &merchant,
+            &token,
+            amount_per_interval,
+            interval_seconds,
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            0,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "vault_created_delegated"), user, merchant),
+            (token, amount_per_interval, interval_seconds, deadline),
+        );
+    }
+
+    /// Cancel a vault on behalf of `user` using a signed meta-transaction.
+    pub fn cancel_vault_with_signature(
+        env: Env,
+        user: Address,
+        merchant: Address,
+        deadline: u64,
+        signature: BytesN<64>,
+    ) {
+        assert!(env.ledger().timestamp() <= deadline, "Signature expired");
+        let nonce = load_user_nonce(&env, &user);
+        let digest = cancel_vault_meta_digest(&env, &user, &merchant, nonce, deadline);
+        verify_meta_signature(&env, &user, &digest, &signature);
+        bump_user_nonce(&env, &user, nonce);
+        remove_vault(&env, &user, &merchant);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// LOYALTY DISCOUNT & META-TRANSACTION HELPERS (#180, #207)
+// ----------------------------------------------------------------------------
+
+/// Best discount in basis points the user's active loyalty stake earns from the
+/// merchant's configured tiers. Zero when unqualified.
+fn loyalty_discount_bps(env: &Env, user: &Address, merchant: &Address) -> u32 {
+    let stake: Option<LoyaltyStake> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::LoyaltyStake(user.clone()));
+    let stake = match stake {
+        Some(s) => s,
+        None => return 0,
+    };
+    let tiers: Option<Vec<LoyaltyTier>> = env
+        .storage()
+        .persistent()
+        .get(&FeatureKey::LoyaltyTiers(merchant.clone()));
+    let mut best = 0u32;
+    if let Some(tiers) = tiers {
+        for tier in tiers.iter() {
+            if stake.amount >= tier.min_lock_amount && tier.discount_bps > best {
+                best = tier.discount_bps;
+            }
+        }
+    }
+    best
+}
+
+fn load_user_nonce(env: &Env, user: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&FeatureKey::UserNonce(user.clone()))
+        .unwrap_or(0)
+}
+
+/// Consumes the nonce so a signature can never be replayed.
+fn bump_user_nonce(env: &Env, user: &Address, current: u64) {
+    let key = FeatureKey::UserNonce(user.clone());
+    let next = current.checked_add(1).expect("Nonce overflow");
+    env.storage().persistent().set(&key, &next);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD_LEDGERS, MIN_TTL_LEDGERS);
+}
+
+/// `SHA256(contract_address || chain_id || nonce || function_symbol || parameters || deadline)`.
+fn meta_digest(
+    env: &Env,
+    function_symbol: &str,
+    params: &Bytes,
+    nonce: u64,
+    deadline: u64,
+) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut data = env.current_contract_address().to_xdr(env);
+    data.append(&Bytes::from_array(
+        env,
+        &env.ledger().network_id().to_array(),
+    ));
+    data.extend_from_array(&nonce.to_be_bytes());
+    data.append(&Symbol::new(env, function_symbol).to_xdr(env));
+    data.append(params);
+    data.extend_from_array(&deadline.to_be_bytes());
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// Digest for `create_vault_with_signature` (#207). Public so relayer tests can
+/// build the message the subscriber must sign.
+pub fn create_vault_meta_digest(
+    env: &Env,
+    user: &Address,
+    merchant: &Address,
+    token: &Address,
+    amount_per_interval: i128,
+    interval_seconds: u64,
+    nonce: u64,
+    deadline: u64,
+) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut params = user.clone().to_xdr(env);
+    params.append(&merchant.clone().to_xdr(env));
+    params.append(&token.clone().to_xdr(env));
+    params.extend_from_array(&amount_per_interval.to_be_bytes());
+    params.extend_from_array(&interval_seconds.to_be_bytes());
+    meta_digest(env, "create_vault", &params, nonce, deadline)
+}
+
+/// Digest for `cancel_vault_with_signature` (#207).
+pub fn cancel_vault_meta_digest(
+    env: &Env,
+    user: &Address,
+    merchant: &Address,
+    nonce: u64,
+    deadline: u64,
+) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    let mut params = user.clone().to_xdr(env);
+    params.append(&merchant.clone().to_xdr(env));
+    meta_digest(env, "cancel_vault", &params, nonce, deadline)
+}
+
+/// Extracts the Ed25519 master key from an account (`G...`) user address.
+fn account_ed25519_key(env: &Env, user: &Address) -> BytesN<32> {
+    use soroban_sdk::xdr::ToXdr;
+    // ScVal::Address XDR: 4-byte discriminant, 4-byte address type, 4-byte
+    // key type, then the 32-byte Ed25519 public key for account addresses.
+    let xdr = user.clone().to_xdr(env);
+    let addr_type: BytesN<4> = xdr.slice(4..8).try_into().expect("Address payload");
+    assert_eq!(
+        addr_type.to_array(),
+        [0, 0, 0, 0],
+        "User must be an account address"
+    );
+    xdr.slice(12..44).try_into().expect("account ed25519 key")
+}
+
+fn verify_meta_signature(env: &Env, user: &Address, digest: &BytesN<32>, signature: &BytesN<64>) {
+    let pubkey = account_ed25519_key(env, user);
+    env.crypto().ed25519_verify(
+        &pubkey,
+        &Bytes::from_array(env, &digest.to_array()),
+        signature,
+    );
 }
 
 /// Checks every split upfront so a bad entry fails before any transfer. Returns the total.
