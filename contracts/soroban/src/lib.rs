@@ -252,7 +252,7 @@ pub fn bounty_claim_digest(
 ) -> BytesN<32> {
     use soroban_sdk::xdr::ToXdr;
     assert!(
-        proof.len() > 0 && proof.len() <= 4096,
+        !proof.is_empty() && proof.len() <= 4096,
         "invalid proof length"
     );
     let mut data = Bytes::from_slice(env, b"orbit:bounty:claim:v1");
@@ -2882,7 +2882,7 @@ impl OrbitContract {
         );
         token::Client::new(&env, &token).transfer(
             &creator,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &amount,
         );
         let bounty = CompetitiveBounty {
@@ -3062,7 +3062,7 @@ impl OrbitContract {
         let mut total = 0i128;
         for input in input_stages.iter() {
             assert!(
-                input.title.len() > 0 && input.title.len() <= 120,
+                !input.title.is_empty() && input.title.len() <= 120,
                 "invalid title"
             );
             assert!(
@@ -3099,7 +3099,7 @@ impl OrbitContract {
         );
         token::Client::new(&env, &token).transfer(
             &merchant,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &total,
         );
         let project = MilestoneProject {
@@ -3137,7 +3137,7 @@ impl OrbitContract {
     ) {
         contractor.require_auth();
         assert!(
-            proof_url.len() > 0 && proof_url.len() <= 512,
+            !proof_url.is_empty() && proof_url.len() <= 512,
             "invalid proof URL"
         );
         let key = DataKey::MilestoneProject(project_id);
@@ -3173,7 +3173,7 @@ impl OrbitContract {
     ) {
         merchant.require_auth();
         assert!(
-            feedback.len() > 0 && feedback.len() <= 512,
+            !feedback.is_empty() && feedback.len() <= 512,
             "invalid review feedback"
         );
         let key = DataKey::MilestoneProject(project_id);
